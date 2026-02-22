@@ -17,9 +17,6 @@ Recommended settings (Target-style long receipt layout):
   Best quality:
     python tesseract_receipt_titles.py --input pdf/target-sale.pdf --dpi 300 --preprocess light --strip-height 1200 --strip-overlap 100 --min-conf 45 --output titles.txt
 
-  Faster Raspberry Pi profile (slightly lower recall):
-    python tesseract_receipt_titles.py --input pdf/target-sale.pdf --dpi 240 --preprocess light --strip-height 1200 --strip-overlap 100 --min-conf 45 --output titles.txt
-
 Notes:
   - Keep --preprocess light for this layout.
   - Keep striping enabled for long pages to limit memory usage.
