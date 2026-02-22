@@ -11,7 +11,7 @@ Designed for low-resource environments (e.g., Raspberry Pi):
 Examples:
   python tesseract_receipt_titles.py --input pdf/target-sale.pdf
   python tesseract_receipt_titles.py --input pdf/target-sale.pdf --dpi 170 --strip-height 1200 --strip-overlap 100
-  python tesseract_receipt_titles.py --input receipt.jpg --output titles.txt --print-debug
+  python tesseract_receipt_titles.py --input receipt.jpg --output titles.txt
 
 Recommended settings (Target-style long receipt layout):
   Best quality:
@@ -21,9 +21,8 @@ Recommended settings (Target-style long receipt layout):
     python tesseract_receipt_titles.py --input pdf/target-sale.pdf --dpi 240 --preprocess light --strip-height 1200 --strip-overlap 100 --min-conf 45 --output titles.txt
 
 Notes:
-  - Keep --preprocess light for this layout; --binary can clip weak characters.
+  - Keep --preprocess light for this layout.
   - Keep striping enabled for long pages to limit memory usage.
-  - If debugging missed text, use --raw-only or --print-raw-lines.
 """
 
 from __future__ import annotations
@@ -32,13 +31,12 @@ import argparse
 import os
 import re
 import shutil
-import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 
 
 @dataclass
@@ -104,36 +102,10 @@ def parse_args() -> argparse.Namespace:
         "--output", default=None, help="Optional output path for plain-text titles."
     )
     parser.add_argument(
-        "--print-debug",
-        action="store_true",
-        help="Print debug stats while processing.",
-    )
-    parser.add_argument(
         "--preprocess",
-        choices=["none", "light", "binary"],
-        default="none",
-        help="Image preprocessing mode before OCR (default: none).",
-    )
-    parser.add_argument(
-        "--print-raw-lines",
-        action="store_true",
-        help="Print raw OCR lines (post-strip merge, pre-filter).",
-    )
-    parser.add_argument(
-        "--raw-output",
-        default=None,
-        help="Optional path to write raw OCR lines (pre-filter).",
-    )
-    parser.add_argument(
-        "--raw-only",
-        action="store_true",
-        help="Output only raw OCR lines and skip title filtering.",
-    )
-    parser.add_argument(
-        "--title-only",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Return only product title text (drop size/brand suffixes). Default: off.",
+        choices=["none", "light"],
+        default="light",
+        help="Image preprocessing mode before OCR (default: light).",
     )
     return parser.parse_args()
 
@@ -200,52 +172,13 @@ def split_vertical_strips(
     return strips
 
 
-def otsu_threshold(gray: np.ndarray) -> int:
-    hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
-    total = gray.size
-    if total == 0:
-        return 127
-
-    sum_total = float(np.dot(np.arange(256), hist))
-    sum_bg = 0.0
-    w_bg = 0.0
-    max_var = -1.0
-    thresh = 127
-
-    for t in range(256):
-        w_bg += hist[t]
-        if w_bg == 0:
-            continue
-        w_fg = total - w_bg
-        if w_fg == 0:
-            break
-        sum_bg += t * hist[t]
-        m_bg = sum_bg / w_bg
-        m_fg = (sum_total - sum_bg) / w_fg
-        between = w_bg * w_fg * (m_bg - m_fg) ** 2
-        if between > max_var:
-            max_var = between
-            thresh = t
-    return int(thresh)
-
-
 def preprocess_strip(strip_np: np.ndarray, mode: str) -> np.ndarray:
     image = Image.fromarray(strip_np).convert("L")
     if mode == "none":
         return np.array(image)
 
     image = ImageOps.autocontrast(image, cutoff=0)
-    if mode == "light":
-        return np.array(image)
-
-    # "binary" mode is strongest and can improve some low-contrast scans,
-    # but may clip weak characters.
-    image = image.filter(ImageFilter.MedianFilter(size=3))
-
-    arr = np.array(image)
-    t = otsu_threshold(arr)
-    bw = np.where(arr > t, 255, 0).astype(np.uint8)
-    return bw
+    return np.array(image)
 
 
 def safe_float(x: str, default: float = -1.0) -> float:
@@ -472,16 +405,6 @@ def likely_item_title(line: OcrLine) -> bool:
     return True
 
 
-def to_product_title(text: str) -> str:
-    t = clean_common_ocr_noise(text)
-    # Most receipt lines are "title - size - brand"; keep only the title prefix.
-    parts = [p.strip(" -") for p in re.split(r"\s+-\s+", t) if p.strip(" -")]
-    if parts:
-        t = parts[0]
-    t = re.sub(r"\s{2,}", " ", t).strip(" -")
-    return t
-
-
 def is_orphan_fragment(text: str) -> bool:
     t = normalize_ws(text)
     if not t:
@@ -587,13 +510,12 @@ def extract_lines_from_image(
     psm: int,
     lang: str,
     preprocess: str,
-    print_debug: bool,
-) -> tuple[list[OcrLine], list[OcrLine]]:
+) -> list[OcrLine]:
     page_np = np.array(image.convert("RGB"))
     strips = split_vertical_strips(page_np, strip_height, strip_overlap)
     all_lines: list[OcrLine] = []
 
-    for i, (y_offset, strip_np) in enumerate(strips):
+    for y_offset, strip_np in strips:
         bw = preprocess_strip(strip_np, mode=preprocess)
         lines = ocr_strip_to_lines(
             bw,
@@ -605,19 +527,13 @@ def extract_lines_from_image(
             lang=lang,
         )
         all_lines.extend(lines)
-        if print_debug:
-            print(
-                f"[debug] page={page_index} strip={i+1}/{len(strips)} y={y_offset} "
-                f"lines={len(lines)}"
-            )
 
     deduped = dedupe_overlap_lines(all_lines, y_tol=18.0)
     # Merge first so split continuation lines (e.g. trailing "120z/8ct")
     # can be joined before title filtering.
     merged_all = merge_wrapped_lines(deduped)
-    raw_merged = merged_all
     filtered_merged = [l for l in merged_all if likely_item_title(l)]
-    return raw_merged, filtered_merged
+    return filtered_merged
 
 
 def run(args: argparse.Namespace) -> list[str]:
@@ -627,7 +543,6 @@ def run(args: argparse.Namespace) -> list[str]:
     ext = os.path.splitext(args.input.lower())[1]
     is_pdf = ext == ".pdf"
     titles: list[OcrLine] = []
-    raw_lines: list[OcrLine] = []
 
     if is_pdf:
         total_pages = get_pdf_page_count(args.input)
@@ -639,7 +554,7 @@ def run(args: argparse.Namespace) -> list[str]:
             )
         for page_index in range(start, end):
             image = load_pdf_page(args.input, page_index, args.dpi)
-            page_raw, page_titles = extract_lines_from_image(
+            page_titles = extract_lines_from_image(
                 image=image,
                 page_index=page_index,
                 strip_height=args.strip_height,
@@ -649,20 +564,11 @@ def run(args: argparse.Namespace) -> list[str]:
                 psm=args.psm,
                 lang=args.lang,
                 preprocess=args.preprocess,
-                print_debug=args.print_debug,
             )
-            raw_lines.extend(page_raw)
-            if args.print_debug:
-                confs = [t.conf for t in page_titles]
-                median_conf = statistics.median(confs) if confs else 0.0
-                print(
-                    f"[debug] page={page_index} title_candidates={len(page_titles)} "
-                    f"median_conf={median_conf:.1f}"
-                )
             titles.extend(page_titles)
     else:
         image = Image.open(args.input).convert("RGB")
-        raw_lines, titles = extract_lines_from_image(
+        titles = extract_lines_from_image(
             image=image,
             page_index=0,
             strip_height=args.strip_height,
@@ -672,25 +578,9 @@ def run(args: argparse.Namespace) -> list[str]:
             psm=args.psm,
             lang=args.lang,
             preprocess=args.preprocess,
-            print_debug=args.print_debug,
         )
-
-    raw_out_lines = [normalize_ws(t.text) for t in raw_lines if normalize_ws(t.text)]
-    if args.print_raw_lines:
-        for line in raw_out_lines:
-            print(f"[raw] {line}")
-    if args.raw_output:
-        with open(args.raw_output, "w", encoding="utf-8") as f:
-            for line in raw_out_lines:
-                f.write(line + "\n")
-    if args.raw_only:
-        return raw_out_lines
-
-    if args.title_only:
-        out_lines = [to_product_title(t.text) for t in titles if normalize_ws(t.text)]
-    else:
-        out_lines = [clean_common_ocr_noise(t.text) for t in titles if normalize_ws(t.text)]
-        out_lines = stitch_ampersand_continuations(out_lines)
+    out_lines = [clean_common_ocr_noise(t.text) for t in titles if normalize_ws(t.text)]
+    out_lines = stitch_ampersand_continuations(out_lines)
 
     # Drop residual non-item lines after title extraction.
     out_lines = [
