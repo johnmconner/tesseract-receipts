@@ -1,0 +1,54 @@
+[filters]
+non_item_patterns = [
+  "\\bpicked up\\b",
+  "\\bshow details\\b",
+  "\\bhide details\\b",
+  "\\bsubtotal\\b",
+  "\\btotal\\b",
+  "\\bamount\\b",
+  "\\btax\\b",
+  "\\bfees?\\b",
+  "\\bpayment\\b",
+  "\\bbalance\\s+due\\b",
+  "\\bchange\\b",
+  "\\bcash\\b",
+  "\\bdebit\\b",
+  "\\bcredit\\b",
+  "\\bvisa\\b",
+  "\\bmastercard\\b",
+  "\\bamex\\b",
+  "\\bunit\\s*price\\b",
+  "\\bprice\\b",
+  "\\bqty\\b",
+  "\\bquantity\\b",
+  "\\bdiscount\\b",
+  "\\bsavings?\\b",
+  "\\bthank you\\b",
+  "\\bstore\\b",
+  "\\btarget\\s*circle\\b",
+  "\\border\\b",
+  "\\breceipt\\b",
+  "\\binvoice\\b",
+  "\\bcard\\b",
+  "\\b(?:mon|tue|wed|thu|fri|sat|sun),\\s",
+  "\\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\\b",
+]
+
+fragment_vocab = [
+  "gather",
+  "good",
+  "tees",
+  "detail",
+  "details",
+  "amount",
+  "discounts",
+]
+
+[thresholds]
+dedupe_y_tol = 18.0
+merge_y_gap_abs = 28.0
+merge_y_gap_mult = 1.4
+merge_x_tol = 28.0
+continuation_word_conf_min = 20.0
+short_noise_conf_max = 78.0
+mixed_gibberish_conf_max = 80.0

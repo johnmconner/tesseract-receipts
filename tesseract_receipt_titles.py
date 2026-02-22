@@ -28,12 +28,18 @@ import argparse
 import os
 import re
 import shutil
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
 from PIL import Image, ImageOps
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover
+    import tomli as tomllib  # type: ignore[no-redef]
 
 
 @dataclass
@@ -55,9 +61,101 @@ class OcrLine:
         return max(1.0, self.y1 - self.y0)
 
 
+@dataclass
+class ReceiptItem:
+    page: int
+    title: str
+    qty: str | None
+    conf: float
+
+
+@dataclass
+class ThresholdConfig:
+    dedupe_y_tol: float
+    merge_y_gap_abs: float
+    merge_y_gap_mult: float
+    merge_x_tol: float
+    continuation_word_conf_min: float
+    short_noise_conf_max: float
+    mixed_gibberish_conf_max: float
+
+
+@dataclass
+class RetailerConfig:
+    non_item_patterns: list[str]
+    fragment_vocab: set[str]
+    thresholds: ThresholdConfig
+
+
+DEFAULT_CONFIG_PATH = (
+    Path(__file__).resolve().parent / "configs" / "target.toml"
+)
+ACTIVE_CONFIG: RetailerConfig | None = None
+
+
+def get_active_config() -> RetailerConfig:
+    if ACTIVE_CONFIG is None:
+        raise RuntimeError("Config not initialized.")
+    return ACTIVE_CONFIG
+
+
+def _require_list_str(data: object, key: str) -> list[str]:
+    if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+        raise ValueError(f"{key} must be a list of strings")
+    return list(data)
+
+
+def load_retailer_config(path: str) -> RetailerConfig:
+    cfg_path = Path(path)
+    if not cfg_path.exists():
+        raise SystemExit(f"Config file not found: {cfg_path}")
+
+    with cfg_path.open("rb") as f:
+        raw = tomllib.load(f)
+
+    filters = raw.get("filters")
+    thresholds = raw.get("thresholds")
+    if not isinstance(filters, dict) or not isinstance(thresholds, dict):
+        raise SystemExit(
+            f"Invalid config format in {cfg_path}: expected [filters] and [thresholds] tables"
+        )
+
+    non_item_patterns = _require_list_str(
+        filters.get("non_item_patterns"), "filters.non_item_patterns"
+    )
+    fragment_vocab = set(
+        _require_list_str(filters.get("fragment_vocab"), "filters.fragment_vocab")
+    )
+
+    def _num(name: str, default: float) -> float:
+        val = thresholds.get(name, default)
+        if not isinstance(val, (int, float)):
+            raise ValueError(f"thresholds.{name} must be numeric")
+        return float(val)
+
+    return RetailerConfig(
+        non_item_patterns=non_item_patterns,
+        fragment_vocab=fragment_vocab,
+        thresholds=ThresholdConfig(
+            dedupe_y_tol=_num("dedupe_y_tol", 18.0),
+            merge_y_gap_abs=_num("merge_y_gap_abs", 28.0),
+            merge_y_gap_mult=_num("merge_y_gap_mult", 1.4),
+            merge_x_tol=_num("merge_x_tol", 28.0),
+            continuation_word_conf_min=_num("continuation_word_conf_min", 20.0),
+            short_noise_conf_max=_num("short_noise_conf_max", 78.0),
+            mixed_gibberish_conf_max=_num("mixed_gibberish_conf_max", 80.0),
+        ),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract product title lines from scanned receipts with Tesseract."
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to TOML config for layout/retailer-specific filters and thresholds.",
     )
     parser.add_argument("--input", required=True, help="Path to PDF or image.")
     parser.add_argument(
@@ -97,6 +195,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", default=None, help="Optional output path for plain-text titles."
+    )
+    parser.add_argument(
+        "--include-qty",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include quantity in output (default: on). Use --no-include-qty for title-only lines.",
     )
     parser.add_argument(
         "--preprocess",
@@ -224,6 +328,19 @@ def looks_like_size_tail_token(text: str) -> bool:
     return False
 
 
+def looks_like_continuation_word(text: str) -> bool:
+    t = normalize_ws(text)
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z~]{1,20}", t))
+
+
+def extract_qty_value(text: str) -> str | None:
+    t = normalize_ws(text)
+    m = re.search(r"(?i)\bqty\b\s*([0-9]+(?:\.[0-9]+)?)\b", t)
+    if not m:
+        return None
+    return m.group(1)
+
+
 def ocr_strip_to_lines(
     strip_bw: np.ndarray,
     y_offset: int,
@@ -247,10 +364,8 @@ def ocr_strip_to_lines(
         if not txt:
             continue
         conf = safe_float(data["conf"][i], -1.0)
-        if conf < min_conf:
-            if conf < min_conf_tail or not looks_like_size_tail_token(txt):
-                continue
-
+        if conf < 0:
+            continue
         x = float(data["left"][i])
         y = float(data["top"][i]) + y_offset
         w = float(data["width"][i])
@@ -271,16 +386,50 @@ def ocr_strip_to_lines(
     out: list[OcrLine] = []
     for items in rows.values():
         items.sort(key=lambda it: it["x0"])
-        tokens = [str(it["text"]) for it in items]
-        confs = [float(it["conf"]) for it in items]
+        has_amp = any(str(it["text"]).strip() == "&" for it in items)
+        cfg = get_active_config()
+        kept_items = []
+        for idx, it in enumerate(items):
+            txt = str(it["text"])
+            conf = float(it["conf"])
+            keep = conf >= min_conf
+            if not keep and conf >= min_conf_tail and looks_like_size_tail_token(txt):
+                keep = True
+
+            # Rescue low-confidence continuation words on wrapped brand tails:
+            # e.g., next line contains "& Gather" and "Gather" may score very low.
+            if (
+                not keep
+                and has_amp
+                and conf >= cfg.thresholds.continuation_word_conf_min
+                and looks_like_continuation_word(txt)
+            ):
+                left_neighbor = items[idx - 1] if idx > 0 else None
+                right_neighbor = items[idx + 1] if idx + 1 < len(items) else None
+                neighbor_amp = False
+                if left_neighbor is not None and str(left_neighbor["text"]).strip() == "&":
+                    neighbor_amp = True
+                if right_neighbor is not None and str(right_neighbor["text"]).strip() == "&":
+                    neighbor_amp = True
+                if neighbor_amp:
+                    keep = True
+
+            if keep:
+                kept_items.append(it)
+
+        if not kept_items:
+            continue
+
+        tokens = [str(it["text"]) for it in kept_items]
+        confs = [float(it["conf"]) for it in kept_items]
         line = OcrLine(
             page=page_index,
             text=join_tokens_raw(tokens),
             conf=sum(confs) / len(confs),
-            x0=min(float(it["x0"]) for it in items),
-            y0=min(float(it["y0"]) for it in items),
-            x1=max(float(it["x1"]) for it in items),
-            y1=max(float(it["y1"]) for it in items),
+            x0=min(float(it["x0"]) for it in kept_items),
+            y0=min(float(it["y0"]) for it in kept_items),
+            x1=max(float(it["x1"]) for it in kept_items),
+            y1=max(float(it["y1"]) for it in kept_items),
         )
         if line.text:
             out.append(line)
@@ -316,44 +465,9 @@ def dedupe_overlap_lines(lines: Iterable[OcrLine], y_tol: float = 18.0) -> list[
     return kept
 
 
-NON_ITEM_PATTERNS = [
-    r"\bpicked up\b",
-    r"\bhide details\b",
-    r"\bsubtotal\b",
-    r"\btotal\b",
-    r"\bamount\b",
-    r"\btax\b",
-    r"\bfees?\b",
-    r"\bpayment\b",
-    r"\bbalance\s+due\b",
-    r"\bchange\b",
-    r"\bcash\b",
-    r"\bdebit\b",
-    r"\bcredit\b",
-    r"\bvisa\b",
-    r"\bmastercard\b",
-    r"\bamex\b",
-    r"\bunit\s*price\b",
-    r"\bprice\b",
-    r"\bqty\b",
-    r"\bquantity\b",
-    r"\bdiscount\b",
-    r"\bsavings?\b",
-    r"\bthank you\b",
-    r"\bstore\b",
-    r"\btarget\s*circle\b",
-    r"\border\b",
-    r"\breceipt\b",
-    r"\binvoice\b",
-    r"\bcard\b",
-    r"\b(?:mon|tue|wed|thu|fri|sat|sun),\s",
-    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-]
-
-
 def looks_like_non_item(text: str) -> bool:
     t = text.lower()
-    for pat in NON_ITEM_PATTERNS:
+    for pat in get_active_config().non_item_patterns:
         if re.search(pat, t):
             return True
     if re.search(r"\b\d{1,2}[:/]\d{1,2}([:/]\d{2,4})?\b", t):
@@ -376,9 +490,20 @@ def likely_item_title(line: OcrLine) -> bool:
     if re.search(r"^[^A-Za-z]*[&|]+[^A-Za-z]*$", text):
         return False
     # Filter short low-confidence garbage lines (e.g. "larget Ulrcie").
-    if line.conf < 78:
+    cfg = get_active_config()
+    if line.conf < cfg.thresholds.short_noise_conf_max:
         words = re.findall(r"[A-Za-z]+", text)
         if len(words) <= 2 and "-" not in text and not re.search(r"\d", text):
+            return False
+    # Filter low-confidence mixed alnum gibberish that lacks item structure.
+    if line.conf < cfg.thresholds.mixed_gibberish_conf_max:
+        if (
+            re.search(r"\d", text)
+            and "-" not in text
+            and not re.search(r"(?i)\b(?:oz|ct|lb|lbs|gal)\b", text)
+            and len(text) < 28
+            and not re.search(r"(?i)\b(?:qty|amount|item|tax)\b", text)
+        ):
             return False
     alpha_tokens = re.findall(r"[A-Za-z]+", text)
     if alpha_tokens:
@@ -411,15 +536,7 @@ def is_orphan_fragment(text: str) -> bool:
     alpha_words = re.findall(r"[A-Za-z]{2,}", t.lower())
     if len(alpha_words) < 2:
         return True
-    fragment_vocab = {
-        "gather",
-        "good",
-        "tees",
-        "detail",
-        "details",
-        "amount",
-        "discounts",
-    }
+    fragment_vocab = get_active_config().fragment_vocab
     if len(alpha_words) <= 2 and any(w in fragment_vocab for w in alpha_words):
         return True
     return False
@@ -447,11 +564,35 @@ def stitch_ampersand_continuations(lines: list[str]) -> list[str]:
     return out
 
 
+def stitch_ampersand_continuations_items(items: list[ReceiptItem]) -> list[ReceiptItem]:
+    if not items:
+        return items
+    out: list[ReceiptItem] = []
+    for item in items:
+        t = normalize_ws(item.title)
+        if t.startswith("&") and out:
+            prev = out[-1]
+            prev_norm = prev.title.lower().strip()
+            if prev_norm.endswith("&"):
+                merged = normalize_ws(prev.title.rstrip(" -") + " " + t)
+                merged = re.sub(r"&\s*&\s*", "& ", merged)
+                out[-1] = ReceiptItem(
+                    page=prev.page,
+                    title=normalize_ws(merged),
+                    qty=prev.qty if prev.qty is not None else item.qty,
+                    conf=(prev.conf + item.conf) / 2.0,
+                )
+                continue
+        out.append(ReceiptItem(item.page, t, item.qty, item.conf))
+    return out
+
+
 def should_merge(prev: OcrLine, curr: OcrLine) -> bool:
+    cfg = get_active_config()
     y_gap = curr.y0 - prev.y1
-    if y_gap < 0 or y_gap > max(28.0, prev.h * 1.4):
+    if y_gap < 0 or y_gap > max(cfg.thresholds.merge_y_gap_abs, prev.h * cfg.thresholds.merge_y_gap_mult):
         return False
-    if abs(curr.x0 - prev.x0) > 28:
+    if abs(curr.x0 - prev.x0) > cfg.thresholds.merge_x_tol:
         return False
     if re.search(r"\$\s*\d", curr.text):
         return False
@@ -497,6 +638,29 @@ def merge_wrapped_lines(lines: list[OcrLine]) -> list[OcrLine]:
     return merged
 
 
+def build_receipt_items(merged_all: list[OcrLine]) -> list[ReceiptItem]:
+    title_idxs = [i for i, line in enumerate(merged_all) if likely_item_title(line)]
+    if not title_idxs:
+        return []
+
+    items: list[ReceiptItem] = []
+    for pos, idx in enumerate(title_idxs):
+        line = merged_all[idx]
+        next_idx = title_idxs[pos + 1] if pos + 1 < len(title_idxs) else len(merged_all)
+        qty: str | None = None
+
+        for j in range(idx + 1, min(next_idx, idx + 10)):
+            q = extract_qty_value(merged_all[j].text)
+            if q is not None:
+                qty = q
+                break
+
+        items.append(
+            ReceiptItem(page=line.page, title=line.text, qty=qty, conf=line.conf)
+        )
+    return items
+
+
 def extract_lines_from_image(
     image: Image.Image,
     page_index: int,
@@ -507,7 +671,7 @@ def extract_lines_from_image(
     psm: int,
     lang: str,
     preprocess: str,
-) -> list[OcrLine]:
+) -> list[ReceiptItem]:
     page_np = np.array(image.convert("RGB"))
     strips = split_vertical_strips(page_np, strip_height, strip_overlap)
     all_lines: list[OcrLine] = []
@@ -525,21 +689,23 @@ def extract_lines_from_image(
         )
         all_lines.extend(lines)
 
-    deduped = dedupe_overlap_lines(all_lines, y_tol=18.0)
+    deduped = dedupe_overlap_lines(all_lines, y_tol=get_active_config().thresholds.dedupe_y_tol)
     # Merge first so split continuation lines (e.g. trailing "120z/8ct")
     # can be joined before title filtering.
     merged_all = merge_wrapped_lines(deduped)
-    filtered_merged = [l for l in merged_all if likely_item_title(l)]
-    return filtered_merged
+    return build_receipt_items(merged_all)
 
 
 def run(args: argparse.Namespace) -> list[str]:
+    global ACTIVE_CONFIG
+    ACTIVE_CONFIG = load_retailer_config(args.config)
+
     require_tesseract()
     require_pytesseract()
 
     ext = os.path.splitext(args.input.lower())[1]
     is_pdf = ext == ".pdf"
-    titles: list[OcrLine] = []
+    items: list[ReceiptItem] = []
 
     if is_pdf:
         total_pages = get_pdf_page_count(args.input)
@@ -551,7 +717,7 @@ def run(args: argparse.Namespace) -> list[str]:
             )
         for page_index in range(start, end):
             image = load_pdf_page(args.input, page_index, args.dpi)
-            page_titles = extract_lines_from_image(
+            page_items = extract_lines_from_image(
                 image=image,
                 page_index=page_index,
                 strip_height=args.strip_height,
@@ -562,10 +728,10 @@ def run(args: argparse.Namespace) -> list[str]:
                 lang=args.lang,
                 preprocess=args.preprocess,
             )
-            titles.extend(page_titles)
+            items.extend(page_items)
     else:
         image = Image.open(args.input).convert("RGB")
-        titles = extract_lines_from_image(
+        items = extract_lines_from_image(
             image=image,
             page_index=0,
             strip_height=args.strip_height,
@@ -576,23 +742,34 @@ def run(args: argparse.Namespace) -> list[str]:
             lang=args.lang,
             preprocess=args.preprocess,
         )
-    out_lines = [clean_common_ocr_noise(t.text) for t in titles if normalize_ws(t.text)]
-    out_lines = stitch_ampersand_continuations(out_lines)
+    cleaned_items = [
+        ReceiptItem(
+            page=item.page,
+            title=clean_common_ocr_noise(item.title),
+            qty=item.qty,
+            conf=item.conf,
+        )
+        for item in items
+        if normalize_ws(item.title)
+    ]
+    cleaned_items = stitch_ampersand_continuations_items(cleaned_items)
 
     # Drop residual non-item lines after title extraction.
-    out_lines = [
-        line
-        for line in out_lines
-        if line and not looks_like_non_item(line) and not is_orphan_fragment(line)
+    cleaned_items = [
+        item
+        for item in cleaned_items
+        if item.title
+        and not looks_like_non_item(item.title)
+        and not is_orphan_fragment(item.title)
     ]
-    # Final dedupe after merge/filter pipeline.
-    seen = set()
+
     final: list[str] = []
-    for line in out_lines:
-        key = normalize_for_dedupe(line)
-        if key and key not in seen:
-            seen.add(key)
-            final.append(line)
+    for item in cleaned_items:
+        if args.include_qty:
+            qty = item.qty if item.qty is not None else ""
+            final.append(f"{qty}\t{item.title}")
+        else:
+            final.append(item.title)
     return final
 
 
