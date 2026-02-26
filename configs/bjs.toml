@@ -1,12 +1,19 @@
 [extractor]
-mode = "title"
+mode = "upc"
 qty_search_window = 10
+
+[upc]
+match_patterns = [
+  "(?<!\\d)(?:\\d[\\s-]*){12}(?!\\d)",
+]
+reject_patterns = [
+  "\\b(?:phone|member|membership|order|transaction|auth|approval)\\b",
+]
+normalize_digits_only = true
+allowed_lengths = [12]
 
 [filters]
 non_item_patterns = [
-  "\\bpicked up\\b",
-  "\\bshow details\\b",
-  "\\bhide details\\b",
   "\\bsubtotal\\b",
   "\\btotal\\b",
   "\\bamount\\b",
@@ -21,32 +28,26 @@ non_item_patterns = [
   "\\bvisa\\b",
   "\\bmastercard\\b",
   "\\bamex\\b",
-  "\\bunit\\s*price\\b",
   "\\bprice\\b",
   "\\bqty\\b",
   "\\bquantity\\b",
   "\\bdiscount\\b",
   "\\bsavings?\\b",
   "\\bthank you\\b",
-  "\\bstore\\b",
-  "\\btarget\\s*circle\\b",
-  "\\border\\b",
   "\\breceipt\\b",
   "\\binvoice\\b",
-  "\\bcard\\b",
+  "\\border\\b",
+  "\\bmember(ship)?\\b",
+  "\\btransaction\\b",
+  "\\bapproval\\b",
+  "\\bauthorization\\b",
+  "\\bchange due\\b",
+  "\\bbj'?s\\b",
   "\\b(?:mon|tue|wed|thu|fri|sat|sun),\\s",
   "\\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\\b",
 ]
 
-fragment_vocab = [
-  "gather",
-  "good",
-  "tees",
-  "detail",
-  "details",
-  "amount",
-  "discounts",
-]
+fragment_vocab = []
 
 [thresholds]
 dedupe_y_tol = 18.0

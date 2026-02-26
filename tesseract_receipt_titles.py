@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract product title lines from long scanned receipts using Tesseract.
+Extract receipt item values (titles/UPCs) from long scanned receipts using Tesseract.
 
 Designed for low-resource environments (e.g., Raspberry Pi):
 - Processes long pages in vertical strips
@@ -64,7 +64,7 @@ class OcrLine:
 @dataclass
 class ReceiptItem:
     page: int
-    title: str
+    value: str
     qty: str | None
     conf: float
 
@@ -81,10 +81,26 @@ class ThresholdConfig:
 
 
 @dataclass
+class ExtractorConfig:
+    mode: str
+    qty_search_window: int
+
+
+@dataclass
+class UpcConfig:
+    match_patterns: list[str]
+    reject_patterns: list[str]
+    normalize_digits_only: bool
+    allowed_lengths: set[int]
+
+
+@dataclass
 class RetailerConfig:
     non_item_patterns: list[str]
     fragment_vocab: set[str]
     thresholds: ThresholdConfig
+    extractor: ExtractorConfig
+    upc: UpcConfig
 
 
 DEFAULT_CONFIG_PATH = (
@@ -105,6 +121,34 @@ def _require_list_str(data: object, key: str) -> list[str]:
     return list(data)
 
 
+def _optional_list_str(data: object, key: str) -> list[str]:
+    if data is None:
+        return []
+    return _require_list_str(data, key)
+
+
+def _bool_or_default(data: dict[str, object], key: str, default: bool) -> bool:
+    val = data.get(key, default)
+    if not isinstance(val, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return val
+
+
+def _int_or_default(data: dict[str, object], key: str, default: int) -> int:
+    val = data.get(key, default)
+    if not isinstance(val, int):
+        raise ValueError(f"{key} must be an integer")
+    return val
+
+
+def _optional_list_int(data: object, key: str) -> list[int]:
+    if data is None:
+        return []
+    if not isinstance(data, list) or not all(isinstance(x, int) for x in data):
+        raise ValueError(f"{key} must be a list of integers")
+    return list(data)
+
+
 def load_retailer_config(path: str) -> RetailerConfig:
     cfg_path = Path(path)
     if not cfg_path.exists():
@@ -115,10 +159,18 @@ def load_retailer_config(path: str) -> RetailerConfig:
 
     filters = raw.get("filters")
     thresholds = raw.get("thresholds")
+    extractor_raw = raw.get("extractor", {})
+    upc_raw = raw.get("upc", {})
     if not isinstance(filters, dict) or not isinstance(thresholds, dict):
         raise SystemExit(
             f"Invalid config format in {cfg_path}: expected [filters] and [thresholds] tables"
         )
+    if not isinstance(extractor_raw, dict):
+        raise SystemExit(
+            f"Invalid config format in {cfg_path}: expected [extractor] table"
+        )
+    if not isinstance(upc_raw, dict):
+        raise SystemExit(f"Invalid config format in {cfg_path}: expected [upc] table")
 
     non_item_patterns = _require_list_str(
         filters.get("non_item_patterns"), "filters.non_item_patterns"
@@ -126,6 +178,31 @@ def load_retailer_config(path: str) -> RetailerConfig:
     fragment_vocab = set(
         _require_list_str(filters.get("fragment_vocab"), "filters.fragment_vocab")
     )
+    extractor_mode = str(extractor_raw.get("mode", "title")).strip().lower()
+    if extractor_mode not in {"title", "upc"}:
+        raise SystemExit(
+            f"Invalid extractor mode in {cfg_path}: {extractor_mode!r} (expected 'title' or 'upc')"
+        )
+    qty_search_window = _int_or_default(
+        extractor_raw, "qty_search_window", 10
+    )
+    if qty_search_window < 0:
+        raise SystemExit(
+            f"Invalid extractor.qty_search_window in {cfg_path}: must be >= 0"
+        )
+
+    upc_match_patterns = _optional_list_str(
+        upc_raw.get("match_patterns"), "upc.match_patterns"
+    )
+    if extractor_mode == "upc" and not upc_match_patterns:
+        raise SystemExit(
+            f"Invalid config format in {cfg_path}: upc.match_patterns is required for extractor mode 'upc'"
+        )
+    upc_allowed_lengths = set(
+        _optional_list_int(upc_raw.get("allowed_lengths"), "upc.allowed_lengths")
+    )
+    if not upc_allowed_lengths:
+        upc_allowed_lengths = {12}
 
     def _num(name: str, default: float) -> float:
         val = thresholds.get(name, default)
@@ -145,12 +222,26 @@ def load_retailer_config(path: str) -> RetailerConfig:
             short_noise_conf_max=_num("short_noise_conf_max", 78.0),
             mixed_gibberish_conf_max=_num("mixed_gibberish_conf_max", 80.0),
         ),
+        extractor=ExtractorConfig(
+            mode=extractor_mode,
+            qty_search_window=qty_search_window,
+        ),
+        upc=UpcConfig(
+            match_patterns=upc_match_patterns,
+            reject_patterns=_optional_list_str(
+                upc_raw.get("reject_patterns"), "upc.reject_patterns"
+            ),
+            normalize_digits_only=_bool_or_default(
+                upc_raw, "normalize_digits_only", True
+            ),
+            allowed_lengths=upc_allowed_lengths,
+        ),
     )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract product title lines from scanned receipts with Tesseract."
+        description="Extract receipt item values from scanned receipts with Tesseract."
     )
     parser.add_argument(
         "--config",
@@ -194,7 +285,7 @@ def parse_args() -> argparse.Namespace:
         help="Lower confidence floor for size/unit tail tokens (default: 30).",
     )
     parser.add_argument(
-        "--output", default=None, help="Optional output path for plain-text titles."
+        "--output", default=None, help="Optional output path for plain-text results."
     )
     parser.add_argument(
         "--include-qty",
@@ -336,9 +427,18 @@ def looks_like_continuation_word(text: str) -> bool:
 def extract_qty_value(text: str) -> str | None:
     t = normalize_ws(text)
     m = re.search(r"(?i)\bqty\b\s*([0-9]+(?:\.[0-9]+)?)\b", t)
+    if m:
+        return m.group(1)
+    # BJ's-style item rows often encode quantity inline as "2 of 2" and OCR may
+    # confuse "1" with "|" or "I"/"l" around the qty values.
+    m = re.search(
+        r"(?i)(?<!\d)([0-9Il|])\s+of\s+([0-9Il|])(?!\d)",
+        t,
+    )
     if not m:
         return None
-    return m.group(1)
+    first = m.group(1).translate(str.maketrans({"I": "1", "l": "1", "|": "1"}))
+    return first if first.isdigit() else None
 
 
 def ocr_strip_to_lines(
@@ -569,16 +669,16 @@ def stitch_ampersand_continuations_items(items: list[ReceiptItem]) -> list[Recei
         return items
     out: list[ReceiptItem] = []
     for item in items:
-        t = normalize_ws(item.title)
+        t = normalize_ws(item.value)
         if t.startswith("&") and out:
             prev = out[-1]
-            prev_norm = prev.title.lower().strip()
+            prev_norm = prev.value.lower().strip()
             if prev_norm.endswith("&"):
-                merged = normalize_ws(prev.title.rstrip(" -") + " " + t)
+                merged = normalize_ws(prev.value.rstrip(" -") + " " + t)
                 merged = re.sub(r"&\s*&\s*", "& ", merged)
                 out[-1] = ReceiptItem(
                     page=prev.page,
-                    title=normalize_ws(merged),
+                    value=normalize_ws(merged),
                     qty=prev.qty if prev.qty is not None else item.qty,
                     conf=(prev.conf + item.conf) / 2.0,
                 )
@@ -638,27 +738,114 @@ def merge_wrapped_lines(lines: list[OcrLine]) -> list[OcrLine]:
     return merged
 
 
-def build_receipt_items(merged_all: list[OcrLine]) -> list[ReceiptItem]:
+def find_qty_near_line(
+    merged_all: list[OcrLine], idx: int, next_idx: int, window: int
+) -> str | None:
+    if window <= 0:
+        return None
+    qty: str | None = None
+    for j in range(idx + 1, min(next_idx, idx + window)):
+        q = extract_qty_value(merged_all[j].text)
+        if q is not None:
+            qty = q
+            break
+    return qty
+
+
+def build_receipt_items_title_mode(merged_all: list[OcrLine]) -> list[ReceiptItem]:
     title_idxs = [i for i, line in enumerate(merged_all) if likely_item_title(line)]
     if not title_idxs:
         return []
 
+    qty_window = get_active_config().extractor.qty_search_window
     items: list[ReceiptItem] = []
     for pos, idx in enumerate(title_idxs):
         line = merged_all[idx]
         next_idx = title_idxs[pos + 1] if pos + 1 < len(title_idxs) else len(merged_all)
-        qty: str | None = None
-
-        for j in range(idx + 1, min(next_idx, idx + 10)):
-            q = extract_qty_value(merged_all[j].text)
-            if q is not None:
-                qty = q
-                break
+        qty = find_qty_near_line(merged_all, idx, next_idx, qty_window)
 
         items.append(
-            ReceiptItem(page=line.page, title=line.text, qty=qty, conf=line.conf)
+            ReceiptItem(page=line.page, value=line.text, qty=qty, conf=line.conf)
         )
     return items
+
+
+def normalize_upc_value(value: str) -> str:
+    return re.sub(r"\D+", "", value)
+
+
+def extract_upc_from_line(line: OcrLine) -> str | None:
+    cfg = get_active_config()
+    upc_cfg = cfg.upc
+    text = normalize_ws(line.text)
+    if not text:
+        return None
+    if looks_like_non_item(text):
+        return None
+
+    lower_text = text.lower()
+    for pat in upc_cfg.reject_patterns:
+        if re.search(pat, lower_text):
+            return None
+
+    for pat in upc_cfg.match_patterns:
+        for m in re.finditer(pat, text):
+            candidate = m.group(0)
+            normalized = (
+                normalize_upc_value(candidate)
+                if upc_cfg.normalize_digits_only
+                else normalize_ws(candidate)
+            )
+            if not normalized:
+                continue
+            if upc_cfg.reject_patterns:
+                rejected = False
+                for reject_pat in upc_cfg.reject_patterns:
+                    if re.search(reject_pat, normalized.lower()):
+                        rejected = True
+                        break
+                if rejected:
+                    continue
+            if upc_cfg.allowed_lengths and len(normalized) not in upc_cfg.allowed_lengths:
+                continue
+            if upc_cfg.normalize_digits_only and not normalized.isdigit():
+                continue
+            return normalized
+    return None
+
+
+def build_receipt_items_upc_mode(merged_all: list[OcrLine]) -> list[ReceiptItem]:
+    qty_window = get_active_config().extractor.qty_search_window
+    matched_lines: list[tuple[int, str]] = []
+    for idx, line in enumerate(merged_all):
+        upc = extract_upc_from_line(line)
+        if upc is None:
+            continue
+        matched_lines.append((idx, upc))
+
+    if not matched_lines:
+        return []
+
+    items: list[ReceiptItem] = []
+    for pos, (idx, upc) in enumerate(matched_lines):
+        line = merged_all[idx]
+        next_idx = (
+            matched_lines[pos + 1][0]
+            if pos + 1 < len(matched_lines)
+            else len(merged_all)
+        )
+        qty = extract_qty_value(line.text)
+        if qty is None:
+            qty = find_qty_near_line(merged_all, idx, next_idx, qty_window)
+        items.append(ReceiptItem(page=line.page, value=upc, qty=qty, conf=line.conf))
+    return items
+
+
+def build_receipt_items(merged_all: list[OcrLine]) -> list[ReceiptItem]:
+    mode = get_active_config().extractor.mode
+    if mode == "upc":
+        return build_receipt_items_upc_mode(merged_all)
+    return build_receipt_items_title_mode(merged_all)
 
 
 def extract_lines_from_image(
@@ -699,6 +886,7 @@ def extract_lines_from_image(
 def run(args: argparse.Namespace) -> list[str]:
     global ACTIVE_CONFIG
     ACTIVE_CONFIG = load_retailer_config(args.config)
+    extractor_mode = get_active_config().extractor.mode
 
     require_tesseract()
     require_pytesseract()
@@ -742,34 +930,49 @@ def run(args: argparse.Namespace) -> list[str]:
             lang=args.lang,
             preprocess=args.preprocess,
         )
-    cleaned_items = [
-        ReceiptItem(
-            page=item.page,
-            title=clean_common_ocr_noise(item.title),
-            qty=item.qty,
-            conf=item.conf,
-        )
-        for item in items
-        if normalize_ws(item.title)
-    ]
-    cleaned_items = stitch_ampersand_continuations_items(cleaned_items)
+    if extractor_mode == "title":
+        cleaned_items = [
+            ReceiptItem(
+                page=item.page,
+                value=clean_common_ocr_noise(item.value),
+                qty=item.qty,
+                conf=item.conf,
+            )
+            for item in items
+            if normalize_ws(item.value)
+        ]
+        cleaned_items = stitch_ampersand_continuations_items(cleaned_items)
 
-    # Drop residual non-item lines after title extraction.
-    cleaned_items = [
-        item
-        for item in cleaned_items
-        if item.title
-        and not looks_like_non_item(item.title)
-        and not is_orphan_fragment(item.title)
-    ]
+        # Drop residual non-item lines after title extraction.
+        cleaned_items = [
+            item
+            for item in cleaned_items
+            if item.value
+            and not looks_like_non_item(item.value)
+            and not is_orphan_fragment(item.value)
+        ]
+    else:
+        cleaned_items = [
+            ReceiptItem(
+                page=item.page,
+                value=normalize_upc_value(item.value)
+                if get_active_config().upc.normalize_digits_only
+                else normalize_ws(item.value),
+                qty=item.qty,
+                conf=item.conf,
+            )
+            for item in items
+            if normalize_ws(item.value)
+        ]
+        cleaned_items = [item for item in cleaned_items if item.value]
 
     final: list[str] = []
     for item in cleaned_items:
         if args.include_qty:
             qty = item.qty if item.qty is not None else ""
-            final.append(f"{qty}\t{item.title}")
+            final.append(f"{qty}\t{item.value}")
         else:
-            final.append(item.title)
+            final.append(item.value)
     return final
 
 
